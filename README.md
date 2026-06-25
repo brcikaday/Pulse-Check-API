@@ -1,135 +1,146 @@
 # Pulse-Check-API ("Watchdog" Sentinel)
-This challenge is designed to test your ability to bridge Computer Science fundamentals with Modern Backend Engineering.
 
-## 1. Business Context
-> **Client:** *CritMon Servers Inc.* (A Critical Infrastructure Monitoring Company).
-
-### The Problem
-CritMon provides monitoring for remote solar farms and unmanned weather stations in areas with poor connectivity. These devices are supposed to send "I'm alive" signals every hour.
-
-Currently, CritMon has no way of knowing if a device has gone offline (due to power failure or theft) until a human manually checks the logs. They need a system that alerts *them* when a device *stops* talking.
-
-### The Solution
-You need to build a **Dead Man’s Switch API**. Devices will register a "monitor" with a countdown timer (e.g., 60 seconds). If the device fails to "ping" (send a heartbeat) to the API before the timer runs out, the system automatically triggers an alert.
+A Dead Man's Switch monitoring API built with **Flask**. Devices register a monitor with a countdown timer, send periodic heartbeats to stay "alive," and trigger an alert if they go silent for too long.
 
 ---
 
-## 2. Technical Objective
-Build a backend service that manages stateful timers.
+## 1. Architecture & Design Decisions
 
-* **Registration:** Allow a client to create a monitor with a specific timeout duration.
-* **Heartbeat:** Reset the countdown when a ping is received.
-* **Trigger:** Fire a webhook (or log a critical error) if the countdown reaches zero.
+This design includes one deliberate addition beyond the base spec: a **grace period** for missed heartbeats. Rather than marking a device `down` the instant a single heartbeat is missed, the system tolerates one consecutive miss before declaring it down — see §4 (Developer's Choice) for the full reasoning. This decision shapes the data model and state machine below, so it's introduced here first.
 
+### 1.1 Data Model
+
+Each monitor is represented with the following fields:
+
+| Field             | Type                             | Purpose                                                                                              |
+| ----------------- | -------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `id`              | string                           | Unique identifier for the device (also used as the APScheduler job ID — see §1.3)                    |
+| `timeout_seconds` | number                           | How long the countdown runs before a missed heartbeat is registered                                  |
+| `alert_email`     | string                           | Destination for the down alert                                                                       |
+| `status`          | enum: `active`, `paused`, `down` | Current state of the monitor                                                                         |
+| `missed_count`    | integer                          | Tracks consecutive missed heartbeats, used for the grace-period feature (see §3, Developer's Choice) |
+| `last_heartbeat`  | timestamp                        | Last time the device checked in; surfaced on status/dashboard endpoints                              |
+
+**Why no separate "grace period" status?** A monitor that has missed one heartbeat isn't dead yet — it's still `active`, just with `missed_count = 1`. `status` answers "is this thing fine, paused, or dead," while `missed_count` separately answers "how close is it to dead." Keeping these as two independent fields (rather than inventing a 4th status value) avoids duplicating state that's already expressible as a combination of the existing two.
+
+### 1.2 State Machine
+
+| From                                           | Event                             | To                                            |
+| ---------------------------------------------- | --------------------------------- | --------------------------------------------- |
+| `active` (missed_count = 0)                    | Timer expires, no heartbeat       | `active`, `missed_count = 1` (grace used)     |
+| `active` (missed_count = 1)                    | Timer expires again, no heartbeat | `down`                                        |
+| **any status** (`active`, `paused`, or `down`) | Heartbeat received                | `active`, `missed_count = 0`, timer restarted |
+| `active` (any missed_count)                    | Pause called                      | `paused`, timer stopped                       |
+
+**Note:** Heartbeat is intentionally a single universal rule rather than separate "revive from down" and "unpause" rules. A heartbeat is proof-of-life regardless of what state the monitor was previously in, so reset logic doesn't need to branch on prior status — this also means a `down` monitor self-heals the moment the device starts responding again, with no manual reset endpoint required.
+
+### 1.3 Timer Mechanism
+
+Flask's request/response cycle has no built-in way to "do something after N seconds" independent of an incoming request — by default, nothing happens unless a client sends a request. Since a countdown must expire and fire _without_ any request occurring, this project uses **APScheduler's `BackgroundScheduler`**, which runs on its own thread alongside Flask and can schedule callbacks for arbitrary future times.
+
+- **Job ID = device `id`.** Since device IDs are already guaranteed unique (they're the primary key for monitor lookups), reusing the same `id` as the scheduler's job ID means any job can be looked up, cancelled, or rescheduled in O(1) by key — no scanning through all active jobs.
+- **On registration:** a new job is scheduled to fire after `timeout_seconds`.
+- **On heartbeat:** the existing job for that `id` is cancelled and a fresh one is scheduled.
+- **On pause:** the job for that `id` is cancelled outright, with no replacement.
+- **On job fire (no heartbeat received):** the grace-period logic in §1.2 runs — increment `missed_count` and reschedule, or mark `down`.
+
+### 1.4 Concurrency
+
+Because the scheduler runs on a separate thread from Flask's request handlers, the same monitor record can be read/written from two different threads at nearly the same instant (e.g. a heartbeat arrives just as that device's expiry job fires). This is a classic race condition.
+
+A `threading.Lock()` guards every read-modify-write operation on a monitor's shared fields (`status`, `missed_count`):
+
+- **Heartbeat** — reads and rewrites `status`/`missed_count`, and touches the scheduler job → locked.
+- **Expiry job firing** — reads and rewrites `status`/`missed_count` → locked.
+- **Pause** — reads and rewrites `status` → locked.
+- **Registration** — _not_ locked. The monitor record doesn't exist yet at the moment of creation, so there is no shared data for another thread to race against; the first heartbeat or expiry job for that device can only occur after registration has already completed.
+
+### 1.5 Sequence Diagrams
+
+**Registration**
+
+```mermaid
+sequenceDiagram
+    participant Device
+    participant API
+    participant Scheduler
+
+    Device->>API: POST /monitors {id, timeout, alert_email}
+    API->>Scheduler: schedule expiry job (timeout_seconds)
+    API-->>Device: 201 Created
+```
+
+**Heartbeat (normal reset)**
+
+```mermaid
+sequenceDiagram
+    participant Device
+    participant API
+    participant Scheduler
+
+    Device->>API: POST /monitors/{id}/heartbeat
+    API->>Scheduler: cancel old expiry job
+    API->>API: status = active, missed_count = 0
+    API->>Scheduler: schedule new expiry job
+    API-->>Device: 200 OK
+```
+
+**Timeout → Grace → Down**
+
+```mermaid
+sequenceDiagram
+    participant Scheduler
+    participant API
+
+    Note over Scheduler: timer expires, no heartbeat (1st time)
+    Scheduler->>API: trigger expiry check
+    API->>API: missed_count = 1, status stays active
+    API->>Scheduler: schedule new expiry job
+
+    Note over Scheduler: timer expires again, no heartbeat
+    Scheduler->>API: trigger expiry check
+    API->>API: status = down
+    API->>API: console.log ALERT
+```
+
+**Pause / Unpause**
+
+```mermaid
+sequenceDiagram
+    participant Engineer
+    participant API
+    participant Scheduler
+    participant Device
+
+    Engineer->>API: POST /monitors/{id}/pause
+    API->>Scheduler: cancel expiry job
+    API->>API: status = paused
+    API-->>Engineer: 200 OK
+
+    Device->>API: POST /monitors/{id}/heartbeat
+    API->>API: status = active, missed_count = 0
+    API->>Scheduler: schedule new expiry job
+    API-->>Device: 200 OK
+```
 
 ---
 
-## 3. Getting Started
+## 2. Setup Instructions
 
-1.  **Fork this Repository:** Do not clone it directly. Create a fork to your own GitHub account.
-2.  **Environment:** You may use **Node.js, Python, Java or Go, etc.**.
-3.  **Submission:** Your final submission will be a link to your forked repository containing:
-    * The source code.
-    * The **Architecture Diagram**
-    * The `README.md` with documentation.
+> _TODO — fill in once the Flask project is built (dependencies, how to run, environment variables, etc.)_
 
 ---
 
-## 4. The Architecture Diagram 
-**Task:** Before you write any code, you must design the logic flow.
-**Deliverable:** A **Sequence Diagram** or **State Flowchart** embedded in your `README.md`.
+## 3. API Documentation
+
+> _TODO — fill in endpoint list + example requests/responses once endpoints are implemented._
 
 ---
 
-## 5. User Stories & Acceptance Criteria
+## 4. The Developer's Choice
 
-### User Story 1: Registering a Monitor
-**As a** device administrator,  
-**I want to** create a new monitor for my device,  
-**So that** the system knows to track its status.
+**Feature added: Grace period for missed heartbeats.**
 
-**Acceptance Criteria:**
-- [ ] The API accepts a `POST /monitors` request.
-- [ ] Input: `{"id": "device-123", "timeout": 60, "alert_email": "admin@critmon.com"}`.
-- [ ] The system starts a countdown timer for 60 seconds associated with `device-123`.
-- [ ] Response: `201 Created` with a confirmation message.
+The original brief marks a device `down` the instant a single heartbeat is missed. Given the stated context, solar farms and weather stations in areas with poor connectivity, this is too strict: a single dropped packet would trigger a false alarm and send a repair team on an unnecessary trip. Allowing one missed heartbeat before declaring `down` (tracked via `missed_count`, see §1.1–1.2) tolerates a single transient network failure while still catching genuine outages on the second consecutive miss.
 
-### User Story 2: The Heartbeat (Reset)
-**As a** remote device,  
-**I want to** send a signal to the server,  
-**So that** my timer is reset and no alert is sent.
-
-**Acceptance Criteria:**
-- [ ] The API accepts a `POST /monitors/{id}/heartbeat` request.
-- [ ] If the ID exists and the timer has NOT expired:
-    - [ ] Restart the countdown from the beginning (e.g., reset to 60 seconds).
-    - [ ] Return `200 OK`.
-- [ ] If the ID does not exist:
-    - [ ] Return `404 Not Found`.
-
-### User Story 3: The Alert (Failure State)
-**As a** support engineer,  
-**I want to** be notified immediately if a device stops sending heartbeats,  
-**So that** I can deploy a repair team.
-
-**Acceptance Criteria:**
-- [ ] If the timer for `device-123` reaches 0 seconds (no heartbeat received):
-    - [ ] The system must internally "fire" an alert.
-    - [ ] **Implementation:** For this project, simply `console.log` a JSON object: `{"ALERT": "Device device-123 is down!", "time": <timestamp>}`. (Or simulate sending an email).
-    - [ ] The monitor status changes to `down`.
-
----
-
-## 6. Bonus User Story (The "Snooze" Button)
-**As a** maintenance technician,  
-**I want to** pause monitoring while I am repairing a device,  
-**So that** I don't trigger false alarms.
-
-**Acceptance Criteria:**
-- [ ] Create a `POST /monitors/{id}/pause` endpoint.
-- [ ] When called, the timer stops completely. No alerts will fire.
-- [ ] Calling the heartbeat endpoint again automatically "un-pauses" the monitor and restarts the timer.
-
----
-
-## 7. The "Developer's Choice" Challenge
-We value engineers who look for "what's missing."
-
-**Task:** Identify **one** additional feature that makes this system more robust or user-friendly.
-1.  **Implement it.**
-2.  **Document it:** Explain *why* you added it in your README.
-
----
-
-## 8. Documentation Requirements
-Your final `README.md` must replace these instructions. It must cover:
-
-1.  **Architecture Diagram** 
-2.  **Setup Instructions** 
-3.  **API Documentation** 
-4.  **The Developer's Choice:** Explanation of your added feature.
-
----
-Submit your repo link via the [online](https://forms.office.com/e/rGKtfeZCsH) form.
-
-## 🛑 Pre-Submission Checklist
-**WARNING:** Before you submit your solution, you **MUST** pass every item on this list.
-If you miss any of these critical steps, your submission will be **automatically rejected** and you will **NOT** be invited to an interview.
-
-### 1. 📂 Repository & Code
-- [ ] **Public Access:** Is your GitHub repository set to **Public**? (We cannot review private repos).
-- [ ] **Clean Code:** Did you remove unnecessary files (like `node_modules`, `.env` with real keys, or `.DS_Store`)?
-- [ ] **Run Check:** if we clone your repo and run `npm start` (or equivalent), does the server start immediately without crashing?
-
-### 2. 📄 Documentation (Crucial)
-- [ ] **Architecture Diagram:** Did you include a visual Diagram (Flowchart or Sequence Diagram) in the README?
-- [ ] **README Swap:** Did you **DELETE** the original instructions (the problem brief) from this file and replace it with your own documentation?
-- [ ] **API Docs:** Is there a clear list of Endpoints and Example Requests in the README?
-
-
-### 3. 🧹 Git Hygiene
-- [ ] **Commit History:** Does your repo have multiple commits with meaningful messages? (A single "Initial Commit" is a red flag).
-
----
-**Ready?**
-If you checked all the boxes above, submit your repository link in the application form. Good luck! 🚀
+> _TODO — expand with any concrete example/log output once implemented._
