@@ -127,7 +127,7 @@ sequenceDiagram
 
 ### 1.6 Known Limitations
 
-This implementation uses an in-memory Python dictionary rather than a database. This was a deliberate scope/time tradeoff for a one-week take-home, not an oversight but it's worth being explicit about the cost: **if the server crashes or restarts, every monitor and its current state (status, missed_count, last_heartbeat) is lost.** For a system pitched as monitoring critical infrastructure, that's a real weakness in a production setting. A production version would persist monitor state (e.g. to SQLite or Postgres) and reload/reschedule all active jobs on startup, so an unplanned restart doesn't silently stop tracking every device until someone notices.
+This implementation uses an in-memory Python dictionary rather than a database. This was a deliberate scope/time tradeoff not an oversight but it's worth being explicit about the cost: **if the server crashes or restarts, every monitor and its current state (status, missed_count, last_heartbeat) is lost.** For a system pitched as monitoring critical infrastructure, that's a real weakness in a production setting. A production version would persist monitor state (e.g. to SQLite or Postgres) and reload/reschedule all active jobs on startup, so an unplanned restart doesn't silently stop tracking every device until someone notices.
 
 ---
 
